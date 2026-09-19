@@ -1,12 +1,11 @@
 #include <windows.h>
 #include <tlhelp32.h>
-
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 
 #include <cerrno>
+#include <cwchar>
 #include <cwctype>
-#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <unordered_set>
@@ -14,95 +13,67 @@
 
 #pragma comment(lib, "ole32.lib")
 
-template <typename T>
+template<class T>
 class ComPtr {
-private:
-    T* ptr_ = nullptr;
+    T* p_ = nullptr;
 
 public:
     ComPtr() = default;
-
-    explicit ComPtr(T* ptr)
-        : ptr_(ptr) {
-    }
-
-    ~ComPtr() {
-        reset();
-    }
+    explicit ComPtr(T* p) : p_(p) {}
+    ~ComPtr() { reset(); }
 
     ComPtr(const ComPtr&) = delete;
     ComPtr& operator=(const ComPtr&) = delete;
 
-    ComPtr(ComPtr&& other) noexcept
-        : ptr_(other.ptr_) {
-        other.ptr_ = nullptr;
+    ComPtr(ComPtr&& other) noexcept : p_(other.p_) {
+        other.p_ = nullptr;
     }
 
     ComPtr& operator=(ComPtr&& other) noexcept {
         if (this != &other) {
             reset();
-
-            ptr_ = other.ptr_;
-            other.ptr_ = nullptr;
+            p_ = other.p_;
+            other.p_ = nullptr;
         }
-
         return *this;
     }
 
-    T* get() const {
-        return ptr_;
-    }
-
+    T* get() const { return p_; }
     T** put() {
         reset();
-        return &ptr_;
+        return &p_;
     }
 
-    T* operator->() const {
-        return ptr_;
-    }
-
-    explicit operator bool() const {
-        return ptr_ != nullptr;
-    }
+    T* operator->() const { return p_; }
+    explicit operator bool() const { return p_ != nullptr; }
 
     void reset() {
-        if (ptr_) {
-            ptr_->Release();
-            ptr_ = nullptr;
+        if (p_) {
+            p_->Release();
+            p_ = nullptr;
         }
     }
 };
 
-bool EqualIgnoreCase(
-    const wchar_t* a,
-    const wchar_t* b
-) {
+bool EqualIgnoreCase(const wchar_t* a, const wchar_t* b) {
     if (!a || !b)
         return false;
 
     while (*a && *b) {
-        if (std::towlower(*a) != std::towlower(*b))
+        if (std::towlower(*a++) != std::towlower(*b++))
             return false;
-
-        ++a;
-        ++b;
     }
 
     return *a == *b;
 }
 
-void PrintHresult(
-    const wchar_t* operation,
-    HRESULT hr
-) {
-    std::wcerr
-        << operation
-        << L" failed: 0x"
-        << std::hex
-        << static_cast<unsigned long>(hr)
-        << std::dec
-        << L"\n";
+void PrintError(const wchar_t* action, HRESULT hr) {
+    std::wcerr << action
+               << L" failed: 0x"
+               << std::hex
+               << static_cast<unsigned long>(hr)
+               << std::dec
+               << L'\n';
 }
 
 struct ProcessInfo {
@@ -111,8 +82,8 @@ struct ProcessInfo {
     std::wstring name;
 };
 
-std::vector<ProcessInfo> GetAllProcesses() {
-    std::vector<ProcessInfo> processes;
+std::vector<ProcessInfo> GetProcesses() {
+    std::vector<ProcessInfo> result;
 
     HANDLE snapshot = CreateToolhelp32Snapshot(
         TH32CS_SNAPPROCESS,
@@ -120,14 +91,14 @@ std::vector<ProcessInfo> GetAllProcesses() {
     );
 
     if (snapshot == INVALID_HANDLE_VALUE)
-        return processes;
+        return result;
 
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
 
     if (Process32FirstW(snapshot, &entry)) {
         do {
-            processes.push_back({
+            result.push_back({
                 entry.th32ProcessID,
                 entry.th32ParentProcessID,
                 entry.szExeFile
@@ -136,66 +107,47 @@ std::vector<ProcessInfo> GetAllProcesses() {
     }
 
     CloseHandle(snapshot);
-    return processes;
+    return result;
 }
 
-/*
- * Find the specified process and all of its child processes.
- */
 std::unordered_set<DWORD> FindProcessTree(
     const wchar_t* processName
 ) {
-    const std::vector<ProcessInfo> processes =
-        GetAllProcesses();
+    const auto processes = GetProcesses();
+    std::unordered_set<DWORD> pids;
 
-    std::unordered_set<DWORD> targetPids;
-
+    // Find the requested process.
     for (const auto& process : processes) {
-        if (EqualIgnoreCase(
-                process.name.c_str(),
-                processName)) {
-            targetPids.insert(process.pid);
-        }
+        if (EqualIgnoreCase(process.name.c_str(), processName))
+            pids.insert(process.pid);
     }
 
+    // Add all descendants.
     bool changed;
 
     do {
         changed = false;
 
         for (const auto& process : processes) {
-            if (targetPids.count(process.pid))
-                continue;
-
-            if (targetPids.count(process.parentPid)) {
-                targetPids.insert(process.pid);
+            if (!pids.count(process.pid) &&
+                pids.count(process.parentPid)) {
+                pids.insert(process.pid);
                 changed = true;
             }
         }
     } while (changed);
 
-    return targetPids;
+    return pids;
 }
 
-/*
- * Parse a volume value from 0 to 100.
-
- * The returned value is normalized to 0.0f-1.0f,
- * which is the range required by SetMasterVolume().
- */
-bool ParseVolume(
-    const wchar_t* text,
-    float& volume
-) {
+bool ParseVolume(const wchar_t* text, float& volume) {
     if (!text || !*text)
         return false;
 
     errno = 0;
 
     wchar_t* end = nullptr;
-
-    const unsigned long value =
-        std::wcstoul(text, &end, 10);
+    unsigned long value = std::wcstoul(text, &end, 10);
 
     if (errno == ERANGE ||
         end == text ||
@@ -210,12 +162,13 @@ bool ParseVolume(
 
 struct AudioSession {
     ComPtr<ISimpleAudioVolume> volume;
+    BOOL muted;
 };
 
-HRESULT FindMatchingSessions(
+HRESULT GetMatchingSessions(
     IMMDevice* device,
-    const std::unordered_set<DWORD>& targetPids,
-    std::vector<AudioSession>& sessions
+    const std::unordered_set<DWORD>& pids,
+    std::vector<AudioSession>& result
 ) {
     if (!device)
         return E_INVALIDARG;
@@ -234,77 +187,70 @@ HRESULT FindMatchingSessions(
 
     ComPtr<IAudioSessionEnumerator> enumerator;
 
-    hr = manager->GetSessionEnumerator(
+    if (FAILED(hr = manager->GetSessionEnumerator(
         enumerator.put()
-    );
+    ))) {
+        return hr;
+    }
 
-    if (FAILED(hr))
+    int count = 0;
+
+    if (FAILED(hr = enumerator->GetCount(&count)))
         return hr;
 
-    int sessionCount = 0;
-
-    hr = enumerator->GetCount(&sessionCount);
-
-    if (FAILED(hr))
-        return hr;
-
-    for (int i = 0; i < sessionCount; ++i) {
+    for (int i = 0; i < count; ++i) {
         ComPtr<IAudioSessionControl> control;
 
-        hr = enumerator->GetSession(
-            i,
-            control.put()
-        );
-
-        if (FAILED(hr) || !control)
+        if (FAILED(enumerator->GetSession(i, control.put())))
             continue;
 
         ComPtr<IAudioSessionControl2> control2;
 
-        hr = control->QueryInterface(
+        if (FAILED(control->QueryInterface(
             __uuidof(IAudioSessionControl2),
             reinterpret_cast<void**>(control2.put())
-        );
-
-        if (FAILED(hr) || !control2)
+        ))) {
             continue;
+        }
 
-        DWORD processId = 0;
+        DWORD pid = 0;
 
-        hr = control2->GetProcessId(&processId);
-
-        if (FAILED(hr) || processId == 0)
+        if (FAILED(control2->GetProcessId(&pid)) ||
+            !pids.count(pid)) {
             continue;
-
-        if (!targetPids.count(processId))
-            continue;
+        }
 
         ComPtr<ISimpleAudioVolume> volume;
 
-        hr = control->QueryInterface(
+        if (FAILED(control->QueryInterface(
             __uuidof(ISimpleAudioVolume),
             reinterpret_cast<void**>(volume.put())
-        );
+        ))) {
+            continue;
+        }
 
-        if (FAILED(hr) || !volume)
+        BOOL muted = FALSE;
+
+        if (FAILED(volume->GetMute(&muted)))
             continue;
 
-        sessions.push_back({
-            std::move(volume)
+        result.push_back({
+            std::move(volume),
+            muted
         });
     }
 
     return S_OK;
 }
 
-int wmain(
-    int argc,
-    wchar_t** argv
-) {
+int wmain(int argc, wchar_t* argv[]) {
     if (argc != 3) {
         std::wcerr
             << L"Usage:\n"
-            << L"  VolumeControl.exe <process.exe> mute | unmute | 0-100\n";
+            << L"  VolumeControl.exe <process.exe> mute\n"
+            << L"  VolumeControl.exe <process.exe> unmute\n"
+            << L"  VolumeControl.exe <process.exe> toggle\n"
+            << L"  VolumeControl.exe <process.exe> 0-100\n";
 
         return 1;
     }
@@ -312,32 +258,23 @@ int wmain(
     const wchar_t* processName = argv[1];
     const wchar_t* command = argv[2];
 
-    const bool mute =
-        EqualIgnoreCase(command, L"mute");
+    const bool mute = EqualIgnoreCase(command, L"mute");
+    const bool unmute = EqualIgnoreCase(command, L"unmute");
+    const bool toggle = EqualIgnoreCase(command, L"toggle");
 
-    const bool unmute =
-        EqualIgnoreCase(command, L"unmute");
+    float volumeValue = 0.0f;
+    const bool setVolume = ParseVolume(command, volumeValue);
 
-    float targetVolume = 0.0f;
-
-    const bool setVolume =
-        ParseVolume(command, targetVolume);
-
-    if (!mute && !unmute && !setVolume) {
+    if (!mute && !unmute && !toggle && !setVolume) {
         std::wcerr
-            << L"Invalid command.\n"
-            << L"Use mute, unmute, or a volume from 0 to 100.\n";
-
+            << L"Invalid command. Use mute, unmute, toggle, or 0-100.\n";
         return 1;
     }
 
-    HRESULT hr = CoInitializeEx(
-        nullptr,
-        COINIT_MULTITHREADED
-    );
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     if (FAILED(hr)) {
-        PrintHresult(L"CoInitializeEx", hr);
+        PrintError(L"CoInitializeEx", hr);
         return 2;
     }
 
@@ -347,25 +284,15 @@ int wmain(
         }
     } comGuard;
 
-    const std::unordered_set<DWORD> targetPids =
-        FindProcessTree(processName);
+    const auto pids = FindProcessTree(processName);
 
-    if (targetPids.empty()) {
+    if (pids.empty()) {
         std::wcerr
             << L"Process not found: "
             << processName
-            << L"\n";
+            << L'\n';
 
         return 3;
-    }
-
-    std::wcout << L"Target process PIDs:\n";
-
-    for (DWORD pid : targetPids) {
-        std::wcout
-            << L"  "
-            << pid
-            << L"\n";
     }
 
     ComPtr<IMMDeviceEnumerator> deviceEnumerator;
@@ -375,26 +302,16 @@ int wmain(
         nullptr,
         CLSCTX_ALL,
         __uuidof(IMMDeviceEnumerator),
-        reinterpret_cast<void**>(
-            deviceEnumerator.put()
-        )
+        reinterpret_cast<void**>(deviceEnumerator.put())
     );
 
     if (FAILED(hr)) {
-        PrintHresult(
-            L"Create device enumerator",
-            hr
-        );
-
+        PrintError(L"Create device enumerator", hr);
         return 4;
     }
 
     ComPtr<IMMDeviceCollection> devices;
 
-    /*
-     * Enumerate all active render devices instead of
-     * using only the default audio device.
-     */
     hr = deviceEnumerator->EnumAudioEndpoints(
         eRender,
         DEVICE_STATE_ACTIVE,
@@ -402,24 +319,14 @@ int wmain(
     );
 
     if (FAILED(hr)) {
-        PrintHresult(
-            L"Enumerate audio devices",
-            hr
-        );
-
+        PrintError(L"Enumerate audio devices", hr);
         return 5;
     }
 
     UINT deviceCount = 0;
 
-    hr = devices->GetCount(&deviceCount);
-
-    if (FAILED(hr)) {
-        PrintHresult(
-            L"Get audio device count",
-            hr
-        );
-
+    if (FAILED(hr = devices->GetCount(&deviceCount))) {
+        PrintError(L"Get audio device count", hr);
         return 6;
     }
 
@@ -428,26 +335,17 @@ int wmain(
     for (UINT i = 0; i < deviceCount; ++i) {
         ComPtr<IMMDevice> device;
 
-        hr = devices->Item(
-            i,
-            device.put()
-        );
-
-        if (FAILED(hr) || !device)
+        if (FAILED(devices->Item(i, device.put())))
             continue;
 
-        hr = FindMatchingSessions(
+        hr = GetMatchingSessions(
             device.get(),
-            targetPids,
+            pids,
             sessions
         );
 
-        if (FAILED(hr)) {
-            PrintHresult(
-                L"Find audio sessions",
-                hr
-            );
-        }
+        if (FAILED(hr))
+            PrintError(L"Find audio sessions", hr);
     }
 
     if (sessions.empty()) {
@@ -458,66 +356,72 @@ int wmain(
         return 7;
     }
 
+    bool targetMute = false;
+
+    if (mute) {
+        targetMute = true;
+    } else if (unmute) {
+        targetMute = false;
+    } else if (toggle) {
+        // Toggle all sessions together.
+        targetMute = false;
+
+        for (const auto& session : sessions) {
+            if (!session.muted) {
+                targetMute = true;
+                break;
+            }
+        }
+    }
+
     int changed = 0;
 
     for (auto& session : sessions) {
-        if (mute) {
-            hr = session.volume->SetMute(
-                TRUE,
-                nullptr
-            );
-        } else if (unmute) {
-            hr = session.volume->SetMute(
-                FALSE,
-                nullptr
-            );
-        } else {
-            /*
-             * Set the volume and unmute the session.
-             */
+        if (setVolume) {
+            // SetMasterVolume uses a range from 0.0 to 1.0.
             hr = session.volume->SetMasterVolume(
-                targetVolume,
+                volumeValue,
                 nullptr
             );
 
+            // Numeric volume commands also unmute the session.
             if (SUCCEEDED(hr)) {
-                session.volume->SetMute(
+                hr = session.volume->SetMute(
                     FALSE,
                     nullptr
                 );
             }
+        } else {
+            hr = session.volume->SetMute(
+                targetMute ? TRUE : FALSE,
+                nullptr
+            );
         }
 
         if (SUCCEEDED(hr)) {
             ++changed;
         } else {
-            PrintHresult(
-                L"Set audio session state",
-                hr
-            );
+            PrintError(L"Set audio session state", hr);
         }
     }
 
     if (setVolume) {
         std::wcout
             << L"Volume set to "
-            << static_cast<int>(
-                targetVolume * 100.0f
-            )
+            << static_cast<int>(volumeValue * 100.0f)
             << L"%";
-
     } else {
         std::wcout
             << L"Result: "
-            << (mute ? L"muted" : L"unmuted");
+            << (targetMute ? L"muted" : L"unmuted");
     }
 
     std::wcout
         << L"; sessions changed: "
         << changed
-        << L"/"
+        << L'/'
         << sessions.size()
-        << L"\n";
+        << L'\n';
 
     return changed > 0 ? 0 : 8;
 }

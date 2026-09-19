@@ -6,6 +6,15 @@ A CLI to change the app volume on Windows.
 
 ## Usage
 
+Go to release page to download it.
+
+```
+VolumeControl.exe <process.exe> mute
+VolumeControl.exe <process.exe> unmute
+VolumeControl.exe <process.exe> toggle
+VolumeControl.exe <process.exe> 0-100
+```
+
 ## Local Development
 
 Prerequisites:
